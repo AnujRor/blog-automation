@@ -1,0 +1,17 @@
+{
+  "name": "blog-automation",
+  "version": "1.0.0",
+  "description": "Automated Hinglish AI and tech blog publisher for Blogger",
+  "type": "module",
+  "main": "scripts/publish-blog.js",
+  "scripts": {
+    "publish": "node scripts/publish-blog.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.6.1"
+  }
+}

@@ -1,0 +1,54 @@
+name: Daily Blog Publish
+
+on:
+  schedule:
+    # Once a day at 06:30 UTC (12:00 PM IST)
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish blog post
+        run: node scripts/publish-blog.js
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          AUTHOR_NAME: ${{ secrets.AUTHOR_NAME }}
+          AUTHOR_BIO: ${{ secrets.AUTHOR_BIO }}
+          PORTFOLIO_URL: ${{ secrets.PORTFOLIO_URL }}
+          AUTHOR_SOCIALS: ${{ secrets.AUTHOR_SOCIALS }}
+          PUBLISH_MODE: ${{ secrets.PUBLISH_MODE }}
+
+      - name: Commit published.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add published.json
+          if git diff --staged --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "chore: update published.json [skip ci]"
+            git pull --rebase origin HEAD || true
+            git push
+          fi
