@@ -71,22 +71,47 @@ function shuffle(list) {
 
 function extractJson(text) {
   let cleaned = String(text).trim();
-  cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-  const first = cleaned.indexOf("{");
-  const last = cleaned.lastIndexOf("}");
-  const firstArr = cleaned.indexOf("[");
-  const lastArr = cleaned.lastIndexOf("]");
-  // Prefer whichever JSON structure appears outermost and valid.
-  if (first !== -1 && last !== -1 && last > first) {
-    if (firstArr !== -1 && lastArr !== -1 && firstArr < first && lastArr > last) {
-      return JSON.parse(cleaned.slice(firstArr, lastArr + 1));
+  // Strip markdown code fences wherever they appear.
+  cleaned = cleaned.replace(/```(?:json)?/gi, "").trim();
+
+  // Slice out the first complete JSON object (balanced braces, string-aware).
+  const sliceBalanced = (str, openChar, closeChar) => {
+    const start = str.indexOf(openChar);
+    if (start === -1) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < str.length; i++) {
+      const ch = str[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === openChar) depth++;
+      else if (ch === closeChar) {
+        depth--;
+        if (depth === 0) return str.slice(start, i + 1);
+      }
     }
-    return JSON.parse(cleaned.slice(first, last + 1));
+    return null;
+  };
+
+  const objectSlice = sliceBalanced(cleaned, "{", "}");
+  if (objectSlice) {
+    try {
+      return JSON.parse(objectSlice);
+    } catch {
+      /* fall through to array attempt */
+    }
   }
-  if (firstArr !== -1 && lastArr !== -1 && lastArr > firstArr) {
-    return JSON.parse(cleaned.slice(firstArr, lastArr + 1));
+  const arraySlice = sliceBalanced(cleaned, "[", "]");
+  if (arraySlice) {
+    return JSON.parse(arraySlice);
   }
-  throw new Error("No JSON found in model response.");
+  throw new Error("No valid JSON object found in model response.");
 }
 
 async function fetchJson(url, options = {}, label = "API") {
@@ -117,136 +142,193 @@ async function fetchJson(url, options = {}, label = "API") {
 
 // ===================== GROQ =====================
 
-let cachedModelId = null;
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Groq free tier limits input tokens per minute (ITPM). We keep a rolling
-// 60s window and wait when a call would cross the safe budget.
+// Groq free tier limits tokens per minute (TPM). We keep a rolling 60s window
+// of (input + reserved output) tokens so we never trip the limit.
 const TOKEN_WINDOW_MS = 60000;
-const SAFE_ITPM = 6000;
+const SAFE_TPM = 5500;
 let tokenWindow = [];
 
-async function throttleInput(inputTokens) {
+async function throttleTokens(tokens) {
   tokenWindow = tokenWindow.filter((t) => Date.now() - t.time < TOKEN_WINDOW_MS);
   const used = tokenWindow.reduce((a, t) => a + t.tokens, 0);
-  if (used + inputTokens > SAFE_ITPM && tokenWindow.length > 0) {
+  if (used + tokens > SAFE_TPM && tokenWindow.length > 0) {
     const oldest = tokenWindow[0];
-    const waitMs = TOKEN_WINDOW_MS - (Date.now() - oldest.time) + 800;
+    const waitMs = TOKEN_WINDOW_MS - (Date.now() - oldest.time) + 1000;
     console.log(
       "Rate limit: waiting " + Math.ceil(waitMs / 1000) + "s to respect Groq tokens/min limit..."
     );
     await sleep(waitMs);
-    return throttleInput(inputTokens);
+    return throttleTokens(tokens);
   }
-  tokenWindow.push({ time: Date.now(), tokens: inputTokens });
+  tokenWindow.push({ time: Date.now(), tokens });
 }
 
-async function pickGroqChatModel() {
-  if (cachedModelId) return cachedModelId;
+let chatModels = null;
+let modelCursor = 0;
+const jsonModeOff = new Set();
+
+function isReasoningModel(id) {
+  return /gpt-oss|deepseek|reasoning|r1/i.test(id);
+}
+
+async function loadGroqChatModels() {
+  if (chatModels) return chatModels;
   const data = await fetchJson(
     "https://api.groq.com/openai/v1/models",
     { headers: { Authorization: `Bearer ${GROQ_API_KEY}` } },
     "Groq model list"
   );
-  const models = Array.isArray(data.data) ? data.data : [];
-  const ids = models
+  const ids = (Array.isArray(data.data) ? data.data : [])
     .map((m) => m.id)
-    .filter((id) => typeof id === "string" && id.length > 0);
+    .filter((id) => typeof id === "string" && id.length > 0)
+    .filter((id) => !/whisper|guard|tts|stt|audio|orpheus|embedding|rerank/i.test(id));
   if (ids.length === 0) {
-    throw new Error("No models available on your Groq account.");
-  }
-  const isChatLike = (id) =>
-    !/whisper|guard|tts|stt|audio|orpheus|embedding|rerank/i.test(id);
-  const llamaIds = ids.filter((id) => id.toLowerCase().includes("llama") && isChatLike(id));
-  const preferred =
-    llamaIds.find((id) => id.includes("llama-3.3-70b")) ||
-    llamaIds.find((id) => id.includes("versatile")) ||
-    llamaIds[0] ||
-    ids.filter(isChatLike).find((id) => id.includes("gpt-oss-120b")) ||
-    ids.filter(isChatLike).find((id) => id.includes("qwen")) ||
-    ids.filter(isChatLike)[0];
-  if (!preferred) {
     throw new Error("No usable chat model available on your Groq account.");
   }
-  cachedModelId = preferred;
-  console.log("Using Groq model: " + preferred);
-  return preferred;
+  const rank = (id) => {
+    if (id.includes("llama-3.3-70b")) return 0;
+    if (id.includes("versatile")) return 1;
+    if (id.toLowerCase().includes("llama")) return 2;
+    if (id.includes("gpt-oss-120b")) return 3;
+    if (id.includes("qwen")) return 4;
+    if (id.includes("gpt-oss-20b")) return 5;
+    return 6;
+  };
+  chatModels = ids.slice().sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  console.log("Groq chat models available (in order): " + chatModels.join(", "));
+  return chatModels;
 }
 
-async function groqChat(messages, maxTokens = 2000) {
-  const model = await pickGroqChatModel();
+function currentModel() {
+  return chatModels[modelCursor % chatModels.length];
+}
+
+async function callGroq(model, messages, maxTokens) {
   const inputChars = messages.reduce((a, m) => a + String(m.content || "").length, 0);
-  const inputTokens = Math.ceil(inputChars / 4) + 50;
+  const inputTokens = Math.ceil(inputChars / 4) + 60;
+  const reasoning = isReasoningModel(model);
+  // Reasoning models need extra room so reasoning tokens never eat the answer.
+  const outputTokens = reasoning ? Math.max(maxTokens, 2048) : maxTokens;
+  await throttleTokens(inputTokens + outputTokens);
 
-  for (let attempt = 1; attempt <= 6; attempt++) {
-    await throttleInput(inputTokens + maxTokens);
-    let res;
-    try {
-      res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: 0.4,
-          max_tokens: maxTokens,
-          response_format: { type: "json_object" },
-        }),
-      });
-    } catch (err) {
-      throw new Error("Groq network error: " + err.message);
-    }
+  const body = {
+    model,
+    messages,
+    temperature: 0.4,
+    max_tokens: outputTokens,
+  };
+  if (!jsonModeOff.has(model)) body.response_format = { type: "json_object" };
+  if (reasoning) body.reasoning_effort = "low";
 
-    const text = await res.text();
+  let res;
+  try {
+    res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    throw new Error("Groq network error: " + err.message);
+  }
+  const text = await res.text();
+  return { status: res.status, ok: res.ok, text, headers: res.headers };
+}
 
-    if (res.status === 429) {
-      const match = text.match(/try again in ([\d.]+)s/i) || text.match(/in ([\d.]+)s/i);
-      const headerRetry = parseFloat(res.headers.get("retry-after") || "0");
-      const waitMs = Math.max(
-        match ? parseFloat(match[1]) * 1000 : 0,
-        headerRetry ? headerRetry * 1000 : 0,
-        15000
-      );
-      console.log(
-        `Groq rate limit (attempt ${attempt}) — waiting ${Math.ceil(waitMs / 1000)}s and retrying...`
-      );
-      await sleep(waitMs + 1000);
-      continue;
-    }
+function serverWaitMs(text, headers) {
+  const match = text.match(/try again in ([\d.]+)s/i) || text.match(/in ([\d.]+)s/i);
+  const headerRetry = parseFloat((headers && headers.get && headers.get("retry-after")) || "0");
+  return Math.max(
+    match ? parseFloat(match[1]) * 1000 : 0,
+    headerRetry ? headerRetry * 1000 : 0,
+    5000
+  );
+}
 
-    if (res.status === 400 && /json/i.test(text)) {
-      console.log(`Groq returned invalid JSON (attempt ${attempt}) — retrying...`);
-      await sleep(2500);
-      continue;
-    }
+const JSON_FIX_INSTRUCTION =
+  "Your previous reply was not valid JSON. Return only raw JSON, no markdown, no code fences, no extra text.";
 
-    if (!res.ok) {
-      let detail = text.slice(0, 300);
-      try {
-        const parsed = JSON.parse(text);
-        detail = parsed.error?.message || parsed.error || detail;
-      } catch {
-        /* keep raw text */
+// Calls Groq and always returns a parsed JSON object. Retries invalid JSON and
+// rate limits, and falls back to the next available model if one keeps failing.
+async function groqJson(messages, maxTokens = 2000) {
+  await loadGroqChatModels();
+  let lastError = null;
+
+  for (let modelTry = 0; modelTry < chatModels.length; modelTry++) {
+    const model = currentModel();
+    let msgs = messages.slice();
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const { status, ok, text, headers } = await callGroq(model, msgs, maxTokens);
+
+      if (status === 429) {
+        const waitMs = serverWaitMs(text, headers);
+        console.log(
+          `Groq rate limit on ${model} (attempt ${attempt}) — waiting ${Math.ceil(waitMs / 1000)}s...`
+        );
+        await sleep(waitMs + 1000);
+        continue;
       }
-      throw new Error(`Groq chat failed (HTTP ${res.status}): ${detail}`);
+
+      if (status === 400 && /response_format|json_object|json mode/i.test(text)) {
+        jsonModeOff.add(model);
+        console.log(`Groq model ${model} rejected JSON mode — retrying without it...`);
+        continue;
+      }
+
+      if (status === 400 && /json/i.test(text)) {
+        jsonModeOff.add(model);
+        msgs = [...messages, { role: "user", content: JSON_FIX_INSTRUCTION }];
+        console.log(
+          `Groq returned invalid JSON on ${model} (attempt ${attempt}) — retrying with stricter instruction...`
+        );
+        await sleep(1500);
+        continue;
+      }
+
+      if (!ok) {
+        lastError = new Error(`Groq (${model}) failed HTTP ${status}: ${text.slice(0, 200)}`);
+        if (status === 404 || /model|decommission|not found|not support/i.test(text)) {
+          console.log(`Groq model ${model} unavailable — trying next model...`);
+          break;
+        }
+        throw lastError;
+      }
+
+      let content = null;
+      try {
+        const data = JSON.parse(text);
+        content = data?.choices?.[0]?.message?.content;
+      } catch {
+        content = null;
+      }
+      if (!content) {
+        lastError = new Error(`Groq (${model}) returned an empty response.`);
+        await sleep(1000);
+        continue;
+      }
+
+      try {
+        return extractJson(content);
+      } catch (err) {
+        jsonModeOff.add(model);
+        lastError = err;
+        msgs = [...messages, { role: "user", content: JSON_FIX_INSTRUCTION }];
+        console.log(`Groq JSON parse failed on ${model} (attempt ${attempt}) — retrying...`);
+        await sleep(1500);
+      }
     }
 
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      throw new Error("Groq returned non-JSON response.");
-    }
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) throw new Error("Groq returned an empty response.");
-    return content;
+    modelCursor++;
   }
 
-  throw new Error("Groq rate limit persisted after multiple retries. Try again in a minute.");
+  throw new Error(
+    "Groq failed on all available models: " + (lastError ? lastError.message : "unknown error")
+  );
 }
 
 // ===================== STEP 1: TOPIC DISCOVERY =====================
@@ -274,41 +356,40 @@ async function fetchNewsHeadlines(keyword) {
 async function chooseTopic(headlinesByKeyword, publishedTopics) {
   const flat = [];
   for (const [keyword, items] of Object.entries(headlinesByKeyword)) {
-    for (const it of items) flat.push(`[${keyword}] ${it.title} (${it.source}${it.date ? ", " + it.date : ""})`);
+    for (const it of items) flat.push(`[${keyword}] ${it.title} (${it.source || "news"})`);
   }
   if (flat.length === 0) return null;
 
-  const prompt = `You are the strict topic selector for a Hinglish blog that ONLY covers these three areas:
+  const prompt = `You are the strict topic selector for a Hinglish blog that ONLY covers:
 1) AI: new AI tools, AI models, chatbots, AI news
-2) Tech: AI-assisted coding, web development, programming, automation and APIs, new software or tech products
-3) Digital marketing with AI: AI tools for SEO, social media, content marketing, ads, email marketing, growth
+2) Tech: AI-assisted coding, web development, programming, automation/APIs, new software or tech products
+3) Digital marketing with AI: AI tools for SEO, social media, content marketing, ads, email, growth
+FORBIDDEN: gaming, politics, celebrity, sports, crime, health, finance tips, entertainment, and marketing topics with no AI/tech tool angle.
 
-FORBIDDEN: gaming, politics, celebrity, sports, crime, health, finance tips, general entertainment, and any digital marketing topic with no AI/tech tool angle. Reject anything unclear.
-
-Today's real news headlines:
+Today's news headlines:
 ${flat.join("\n")}
 
-Topics already published before (never pick these or near-duplicates):
+Already published (never pick again or near-duplicates):
 ${publishedTopics.length ? publishedTopics.join("\n") : "(none yet)"}
 
-Pick the SINGLE best topic that: clearly fits one of the three areas, is NOT already published, has MULTIPLE headlines here (so it can be cross-verified from several sources), and is concrete (a specific tool/model/feature/release — not a vague theme).
+Pick the SINGLE best topic that clearly fits one area, is not already published, is covered by MULTIPLE headlines (so it can be verified), and is concrete (a specific tool/model/feature/release).
 
-Return ONLY this JSON:
-{"topic": "short precise English topic phrase", "area": "AI" or "Tech" or "Digital marketing with AI", "reason": "one sentence"}
+Reply ONLY with this JSON:
+{"topic":"short precise English topic","area":"AI" or "Tech" or "Digital marketing with AI","reason":"one sentence"}
+If nothing clearly fits reply exactly: {"topic":null,"area":null,"reason":null}`;
 
-If nothing clearly fits, return {"topic": null, "area": null, "reason": null}.`;
+  const result = await groqJson(
+    [
+      {
+        role: "system",
+        content: "You are a strict topic selector for an AI/tech Hinglish blog. Reply only with valid JSON.",
+      },
+      { role: "user", content: prompt },
+    ],
+    1200
+  );
 
-  const text = await groqChat([
-    {
-      role: "system",
-      content:
-        "You are a strict topic selector for an AI/tech Hinglish blog. Reply only with valid JSON.",
-    },
-    { role: "user", content: prompt },
-  ], 500);
-
-  const result = extractJson(text);
-  if (!result.topic) return null;
+  if (!result || !result.topic) return null;
   return {
     topic: String(result.topic).trim(),
     area: String(result.area || "AI").trim(),
@@ -374,7 +455,7 @@ async function fetchArticleText(link) {
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("html")) return "";
     const html = await res.text();
-    return stripHtml(html, 1600);
+    return stripHtml(html, 900);
   } catch {
     return "";
   }
@@ -419,7 +500,7 @@ async function researchTopic(topic, seedHeadlines) {
   const topLinks = merged.filter((m) => m.link).slice(0, 5);
   console.log(`Research: fetching full text of ${topLinks.length} source pages...`);
   const sources = [];
-  for (const item of merged.slice(0, 8)) {
+  for (const item of merged.slice(0, 6)) {
     const base = { ...item };
     if (item.link) {
       const fetched = topLinks.find((t) => t.link === item.link);
@@ -443,46 +524,36 @@ async function researchTopic(topic, seedHeadlines) {
 
 async function buildFactSheet(topic, area, sources) {
   const sourceBlocks = sources
+    .slice(0, 6)
     .map((s, i) => {
       const textPart = s.text
-        ? `\nARTICLE TEXT (truncated): ${s.text}`
+        ? `\nTEXT: ${s.text}`
         : s.snippet
-          ? `\nSNIPPET: ${s.snippet}`
-          : "\n(no extra text available)";
-      return `SOURCE ${i + 1}
-TITLE: ${s.title}
-PUBLISHER: ${s.source}
-DATE: ${s.date || "unknown"}
-URL: ${s.link || "(headline only, no URL)"}${textPart}`;
+          ? `\nSNIPPET: ${s.snippet.slice(0, 300)}`
+          : "";
+      return `SOURCE ${i + 1}\nTITLE: ${s.title}\nPUBLISHER: ${s.source}\nURL: ${s.link || "(none)"}${textPart}`;
     })
     .join("\n\n");
 
-  const prompt = `You are a meticulous fact-checker. Below are REAL sources about the topic: "${topic}" (area: ${area}).
+  const prompt = `Extract facts about "${topic}" (area: ${area}) from these REAL sources only.
 
 ${sourceBlocks}
 
-Task: Extract ONLY facts that are clearly supported by the source text above. Rules:
-- Every fact must be verifiable from at least one source listed. NO guesses, NO common-knowledge filler, NO invented numbers, prices, dates, percentages, benchmark scores, user counts or quotes.
-- Prefer facts stated by 2+ sources (mark those "verified_multi": true).
-- Include concrete details only: exact feature names, model names, version numbers, company names, dates, what it does, availability/pricing ONLY if a source states it.
-- Maximum 20 facts. Quality over quantity.
-- "sourceUrls": the exact URLs of the sources that support this fact (empty array only for headline-only items).
+Rules: use ONLY facts stated above. Never invent numbers, dates, prices, percentages, benchmarks or quotes. Prefer facts from 2+ sources (mark verified_multi:true). Max 20 facts. "sourceUrls" = exact URLs supporting the fact.
+Reply ONLY JSON: {"facts":[{"fact":"precise sentence","sourceUrls":["https://..."],"verified_multi":true|false}]}
+If fewer than 5 solid facts exist, reply {"facts":[]}.`;
 
-Return ONLY this JSON:
-{"facts": [{"fact": "one precise sentence", "sourceUrls": ["https://..."], "verified_multi": true or false}]}
+  const result = await groqJson(
+    [
+      {
+        role: "system",
+        content: "You extract only supported facts. Never invent. Reply with valid JSON only.",
+      },
+      { role: "user", content: prompt },
+    ],
+    2500
+  );
 
-If the sources do not contain enough solid facts (fewer than 5), return {"facts": []}.`;
-
-  const text = await groqChat([
-    {
-      role: "system",
-      content:
-        "You are a strict fact-extraction engine. You never invent anything. Reply only with valid JSON.",
-    },
-    { role: "user", content: prompt },
-  ], 3000);
-
-  const result = extractJson(text);
   const facts = Array.isArray(result.facts) ? result.facts.filter((f) => f && f.fact) : [];
   console.log(`Fact sheet: ${facts.length} verified facts extracted.`);
   return facts;
@@ -581,16 +652,18 @@ ${authorRules}
 Return ONLY this JSON:
 {"title": "...", "html": "...", "image_query": "2-4 word English stock photo query", "image_alt": "descriptive alt text including the main keyword", "labels": ["3 to 5 short SEO labels"]}`;
 
-  const text = await groqChat([
-    {
-      role: "system",
-      content:
-        "You are an extremely careful Hinglish tech blog writer. Every sentence must be backed by the provided fact sheet. You always reply with valid JSON only.",
-    },
-    { role: "user", content: prompt },
-  ], 4500);
+  const post = await groqJson(
+    [
+      {
+        role: "system",
+        content:
+          "You are an extremely careful Hinglish tech blog writer. Every sentence must be backed by the provided fact sheet. You always reply with valid JSON only.",
+      },
+      { role: "user", content: prompt },
+    ],
+    4500
+  );
 
-  const post = extractJson(text);
   if (!post.title || !post.html) {
     throw new Error("Groq post response missing title or html.");
   }
@@ -624,11 +697,16 @@ CURRENT POST HTML:
 ${post.html}
 
 Return ONLY JSON: {"html": "full expanded html"}`;
-  const text = await groqChat([
-    { role: "system", content: "You expand Hinglish tech articles strictly within given facts. Reply with valid JSON only." },
-    { role: "user", content: prompt },
-  ], 4500);
-  const result = extractJson(text);
+  const result = await groqJson(
+    [
+      {
+        role: "system",
+        content: "You expand Hinglish tech articles strictly within given facts. Reply with valid JSON only.",
+      },
+      { role: "user", content: prompt },
+    ],
+    4500
+  );
   if (result.html && countWords(result.html) > countWords(post.html)) {
     post.html = String(result.html).trim();
     console.log(`Expanded post to ~${countWords(post.html)} words.`);
@@ -660,12 +738,14 @@ Rules:
 Return ONLY this JSON:
 {"ok": true or false, "removed_claims": ["short description of each unsupported claim removed, empty array if none"], "title": "final title (or same)", "html": "final cleaned html"}`;
 
-  const text = await groqChat([
-    { role: "system", content: "You are a strict fact-checker. Reply with valid JSON only." },
-    { role: "user", content: prompt },
-  ], 4500);
+  const result = await groqJson(
+    [
+      { role: "system", content: "You are a strict fact-checker. Reply with valid JSON only." },
+      { role: "user", content: prompt },
+    ],
+    4500
+  );
 
-  const result = extractJson(text);
   const removed = Array.isArray(result.removed_claims) ? result.removed_claims : [];
   if (result.html && String(result.html).trim().length > 100) {
     post.html = String(result.html).trim();
@@ -776,32 +856,65 @@ async function main() {
   const published = readJson(PUBLISHED_PATH, []);
   const publishedTopics = published.map((p) => String(p.topic || "").toLowerCase());
 
-  const [kw1, kw2] = shuffle(keywords).slice(0, 2);
-  console.log("Random keywords picked: " + [kw1, kw2].join(", "));
+  const MAX_ROUNDS = 3;
+  let chosen = null;
+  let seedHeadlines = [];
+  let roundsAsked = 0;
+  let nullRounds = 0;
+  let errorRounds = 0;
 
-  const headlinesByKeyword = {};
-  for (const kw of [kw1, kw2]) {
+  for (let round = 1; round <= MAX_ROUNDS && !chosen; round++) {
+    const [kw1, kw2] = shuffle(keywords).slice(0, 2);
+    console.log(`--- Discovery round ${round}/${MAX_ROUNDS} — keywords: ${kw1}, ${kw2}`);
+
+    const headlinesByKeyword = {};
+    for (const kw of [kw1, kw2]) {
+      try {
+        const items = await fetchNewsHeadlines(kw);
+        headlinesByKeyword[kw] = items;
+        console.log(`SerpAPI: ${items.length} headlines for "${kw}"`);
+      } catch (err) {
+        console.error("WARNING: " + err.message);
+        headlinesByKeyword[kw] = [];
+      }
+    }
+
+    const flat = Object.values(headlinesByKeyword).flat();
+    if (flat.length === 0) {
+      console.log(`Round ${round}: no headlines collected from SerpAPI.`);
+      continue;
+    }
+
+    roundsAsked++;
     try {
-      const items = await fetchNewsHeadlines(kw);
-      headlinesByKeyword[kw] = items;
-      console.log(`SerpAPI: ${items.length} headlines for "${kw}"`);
+      const pick = await chooseTopic(headlinesByKeyword, publishedTopics);
+      if (pick && pick.topic) {
+        chosen = pick;
+        seedHeadlines = flat;
+      } else {
+        nullRounds++;
+        console.log(`Round ${round}: Groq honestly found no topic that fits.`);
+      }
     } catch (err) {
-      console.error("WARNING: " + err.message);
-      headlinesByKeyword[kw] = [];
+      errorRounds++;
+      console.error(`Round ${round}: Groq error during topic selection — ${err.message}`);
     }
   }
 
-  const seedHeadlines = Object.values(headlinesByKeyword).flat();
-  if (seedHeadlines.length === 0) {
-    console.log("No headlines collected from SerpAPI. Exiting without publishing.");
-    process.exit(0);
+  if (!chosen) {
+    if (errorRounds > 0) {
+      fail(
+        "Topic selection failed because of a Groq error (invalid JSON or rate limit), not because the niche was empty. " +
+          `Rounds: ${roundsAsked} asked, ${nullRounds} honest empty, ${errorRounds} Groq error(s). Check Groq and re-run.`
+      );
+    }
+    if (roundsAsked > 0 && nullRounds === roundsAsked) {
+      console.log("No topic clearly fits the niche (Groq honestly answered null in every round). Exiting without publishing.");
+      process.exit(0);
+    }
+    fail(`Could not complete topic discovery (rounds asked: ${roundsAsked}, empty: ${nullRounds}). Check SerpAPI.`);
   }
 
-  const chosen = await chooseTopic(headlinesByKeyword, publishedTopics);
-  if (!chosen || !chosen.topic) {
-    console.log("No topic clearly fits the niche. Exiting without publishing.");
-    process.exit(0);
-  }
   console.log(`Topic chosen: "${chosen.topic}" (${chosen.area}) — ${chosen.reason}`);
 
   const topicLower = chosen.topic.toLowerCase();
