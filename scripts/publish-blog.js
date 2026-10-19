@@ -353,48 +353,50 @@ async function fetchNewsHeadlines(keyword) {
     }));
 }
 
-async function chooseTopic(headlinesByKeyword, publishedTopics) {
+async function chooseTopics(headlinesByKeyword, publishedTopics) {
   const flat = [];
   for (const [keyword, items] of Object.entries(headlinesByKeyword)) {
     for (const it of items) flat.push(`[${keyword}] ${it.title} (${it.source || "news"})`);
   }
-  if (flat.length === 0) return null;
+  if (flat.length === 0) return [];
 
-  const prompt = `You are the strict topic selector for a Hinglish blog that ONLY covers:
+  const prompt = `You are the topic selector for a Hinglish blog covering ONLY:
 1) AI: new AI tools, AI models, chatbots, AI news
 2) Tech: AI-assisted coding, web development, programming, automation/APIs, new software or tech products
 3) Digital marketing with AI: AI tools for SEO, social media, content marketing, ads, email, growth
-FORBIDDEN: gaming, politics, celebrity, sports, crime, health, finance tips, entertainment, and marketing topics with no AI/tech tool angle.
+FORBIDDEN: gaming, politics, celebrity, sports, crime, health, finance tips, entertainment, and marketing with no AI/tech tool angle.
 
-Today's news headlines:
+Headlines:
 ${flat.join("\n")}
 
-Already published (never pick again or near-duplicates):
+Already published (avoid these and near-duplicates):
 ${publishedTopics.length ? publishedTopics.join("\n") : "(none yet)"}
 
-Pick the SINGLE best topic that clearly fits one area, is not already published, is covered by MULTIPLE headlines (so it can be verified), and is concrete (a specific tool/model/feature/release).
+Pick up to 3 of the BEST concrete topics, best first. Each must fit an area and be clearly covered by at least one headline naming a real tool, model, product, feature or company action (e.g. "Krea 3 AI image editor", "Tencent open-source coding model"). IGNORE headlines that don't fit and use the ones that do.
+Return [] only if NO headline names any AI/tech tool, model, product or feature.
 
-Reply ONLY with this JSON:
-{"topic":"short precise English topic","area":"AI" or "Tech" or "Digital marketing with AI","reason":"one sentence"}
-If nothing clearly fits reply exactly: {"topic":null,"area":null,"reason":null}`;
+Reply ONLY JSON: {"topics":[{"topic":"...","area":"...","reason":"..."}]} (or {"topics":[]}).`;
 
   const result = await groqJson(
     [
       {
         role: "system",
-        content: "You are a strict topic selector for an AI/tech Hinglish blog. Reply only with valid JSON.",
+        content: "You are a topic selector for an AI/tech Hinglish blog. Reply only with valid JSON.",
       },
       { role: "user", content: prompt },
     ],
     1200
   );
 
-  if (!result || !result.topic) return null;
-  return {
-    topic: String(result.topic).trim(),
-    area: String(result.area || "AI").trim(),
-    reason: String(result.reason || "").trim(),
-  };
+  const list = Array.isArray(result.topics) ? result.topics : [];
+  return list
+    .filter((t) => t && t.topic)
+    .slice(0, 3)
+    .map((t) => ({
+      topic: String(t.topic).trim(),
+      area: String(t.area || "AI").trim(),
+      reason: String(t.reason || "").trim(),
+    }));
 }
 
 // ===================== STEP 2: DEEP RESEARCH =====================
@@ -455,7 +457,7 @@ async function fetchArticleText(link) {
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("html")) return "";
     const html = await res.text();
-    return stripHtml(html, 900);
+    return stripHtml(html, 1500);
   } catch {
     return "";
   }
@@ -497,10 +499,10 @@ async function researchTopic(topic, seedHeadlines) {
   }
 
   // Fetch the real article text of the top sources so facts come from actual pages.
-  const topLinks = merged.filter((m) => m.link).slice(0, 5);
+  const topLinks = merged.filter((m) => m.link).slice(0, 8);
   console.log(`Research: fetching full text of ${topLinks.length} source pages...`);
   const sources = [];
-  for (const item of merged.slice(0, 6)) {
+  for (const item of merged.slice(0, 8)) {
     const base = { ...item };
     if (item.link) {
       const fetched = topLinks.find((t) => t.link === item.link);
@@ -524,7 +526,7 @@ async function researchTopic(topic, seedHeadlines) {
 
 async function buildFactSheet(topic, area, sources) {
   const sourceBlocks = sources
-    .slice(0, 6)
+    .slice(0, 8)
     .map((s, i) => {
       const textPart = s.text
         ? `\nTEXT: ${s.text}`
@@ -535,13 +537,13 @@ async function buildFactSheet(topic, area, sources) {
     })
     .join("\n\n");
 
-  const prompt = `Extract facts about "${topic}" (area: ${area}) from these REAL sources only.
+  const prompt = `Extract EVERY concrete fact about "${topic}" (area: ${area}) from these REAL sources only.
 
 ${sourceBlocks}
 
-Rules: use ONLY facts stated above. Never invent numbers, dates, prices, percentages, benchmarks or quotes. Prefer facts from 2+ sources (mark verified_multi:true). Max 20 facts. "sourceUrls" = exact URLs supporting the fact.
+Rules: use ONLY what is written above. Never invent numbers, dates, prices, percentages, benchmarks or quotes. Extract all specific details: product/model names, versions, features, companies, availability, what it does, who made it. Prefer facts from 2+ sources (mark verified_multi:true). Up to 25 facts. "sourceUrls" = exact URLs supporting the fact.
 Reply ONLY JSON: {"facts":[{"fact":"precise sentence","sourceUrls":["https://..."],"verified_multi":true|false}]}
-If fewer than 5 solid facts exist, reply {"facts":[]}.`;
+Return {"facts":[]} only if the sources contain no usable facts about the topic at all.`;
 
   const result = await groqJson(
     [
@@ -551,7 +553,7 @@ If fewer than 5 solid facts exist, reply {"facts":[]}.`;
       },
       { role: "user", content: prompt },
     ],
-    2500
+    3500
   );
 
   const facts = Array.isArray(result.facts) ? result.facts.filter((f) => f && f.fact) : [];
@@ -643,9 +645,9 @@ ${refList}
 
 HARD RULES (violating any = failed post):
 1. Write ONLY facts from the fact sheet. If a number, date, price, percentage, version, benchmark or quote is NOT in the fact sheet, do NOT write it. No general knowledge filler, no "experts believe", no predictions.
-2. Do not add your own opinions presented as facts.
-3. Structure: catchy title (max ~70 chars, include main keyword, NO author name) → short intro with the main keyword → 4 to 5 sections with clean <h2>/<h3> headings and 1-2 paragraphs each → conclusion → then a final section <h2>References</h2> with a <ul> of 3-4 <li><a href="URL">source title</a></li> items using the reference URLs above.
-4. Total body length INCLUDING headings and References: 600 to 800 words.
+2. Do not add your own opinions presented as facts. You MAY add explanatory sentences that help the reader understand something already stated in the facts (what it means, why it matters), as long as they introduce no new fact.
+3. LENGTH IS A REQUIREMENT: the final post must be 650 to 800 words. Write exactly 5 sections (use <h2>). Each section must have 2 full paragraphs of 3-5 sentences each. The intro and conclusion must each be at least 3 sentences. Do NOT stop early.
+4. Structure: catchy title (max ~70 chars, include main keyword, NO author name) → intro with the main keyword → 5 sections with <h2> headings and 2 paragraphs each → conclusion → then a final section <h2>References</h2> with a <ul> of 3-4 <li><a href="URL">source title</a></li> items using the reference URLs above.
 5. Clean HTML only: <p>, <h2>, <h3>, <ul>, <li>, <strong>, <em>, <a>. NO <html>, <head>, <body>, <script>, <style>, <img>, <figure>, NO markdown.
 ${authorRules}
 
@@ -731,12 +733,12 @@ ${post.html}
 Rules:
 - Find every factual claim in the post (names, versions, dates, numbers, features, availability, pricing, quotes).
 - A claim is OK only if it matches the verified fact list.
-- Remove or rewrite any unsupported claim so the post stays accurate and natural. Also remove any sentence that adds no information (filler/hype with no fact).
+- UNSUPPORTED CLAIM → FIX, DON'T DELETE: rewrite the sentence so it only says what the facts support (or replace it with a sentence built from the facts). Only remove a sentence completely if it truly cannot be made accurate OR it is pure hype with zero information.
+- Do NOT shrink the post. Keep the final post 650-800 words and keep all 5 <h2> sections plus the intro, conclusion and <h2>References</h2> section.
 - Do not change the author branding rules: title must not contain an author name.
-- Keep 600-800 words if possible. Keep the References <h2> section at the end.
 
 Return ONLY this JSON:
-{"ok": true or false, "removed_claims": ["short description of each unsupported claim removed, empty array if none"], "title": "final title (or same)", "html": "final cleaned html"}`;
+{"ok": true or false, "removed_claims": ["short description of each unsupported claim you fixed or removed, empty array if none"], "title": "final title (or same)", "html": "final cleaned html"}`;
 
   const result = await groqJson(
     [
@@ -857,11 +859,11 @@ async function main() {
   const publishedTopics = published.map((p) => String(p.topic || "").toLowerCase());
 
   const MAX_ROUNDS = 3;
-  let chosen = null;
-  let seedHeadlines = [];
+  let chosen = null; // { topic, area, reason, sources, facts, refs }
   let roundsAsked = 0;
   let nullRounds = 0;
   let errorRounds = 0;
+  let candidateErrors = 0;
 
   for (let round = 1; round <= MAX_ROUNDS && !chosen; round++) {
     const [kw1, kw2] = shuffle(keywords).slice(0, 2);
@@ -886,75 +888,87 @@ async function main() {
     }
 
     roundsAsked++;
+    let candidates;
     try {
-      const pick = await chooseTopic(headlinesByKeyword, publishedTopics);
-      if (pick && pick.topic) {
-        chosen = pick;
-        seedHeadlines = flat;
-      } else {
-        nullRounds++;
-        console.log(`Round ${round}: Groq honestly found no topic that fits.`);
-      }
+      candidates = await chooseTopics(headlinesByKeyword, publishedTopics);
     } catch (err) {
       errorRounds++;
       console.error(`Round ${round}: Groq error during topic selection — ${err.message}`);
+      continue;
+    }
+
+    if (!candidates || candidates.length === 0) {
+      nullRounds++;
+      console.log(`Round ${round}: Groq found no topic that fits.`);
+      continue;
+    }
+    console.log(
+      `Round ${round}: ${candidates.length} candidate topic(s): ${candidates.map((c) => c.topic).join(" | ")}`
+    );
+
+    // Research each candidate until one has enough verified facts.
+    for (const cand of candidates) {
+      const topicLower = cand.topic.toLowerCase();
+      const dup = published.some((p) => {
+        const t = String(p.topic || "").toLowerCase();
+        return t === topicLower || topicLower.includes(t) || t.includes(topicLower);
+      });
+      if (dup) {
+        console.log(`Candidate "${cand.topic}" already published — skipping.`);
+        continue;
+      }
+
+      let sources;
+      try {
+        sources = await researchTopic(cand.topic, flat);
+      } catch (err) {
+        console.error(`Candidate "${cand.topic}" research failed — ${err.message}`);
+        candidateErrors++;
+        continue;
+      }
+
+      let facts;
+      try {
+        facts = await buildFactSheet(cand.topic, cand.area, sources);
+      } catch (err) {
+        console.error(`Candidate "${cand.topic}" fact extraction failed — ${err.message}`);
+        candidateErrors++;
+        continue;
+      }
+
+      const refs = uniqueSourceLinks(facts, sources);
+      if (facts.length >= 8 && refs.length > 0) {
+        chosen = { ...cand, sources, facts, refs };
+        break;
+      }
+      console.log(
+        `Candidate "${cand.topic}" has only ${facts.length} fact(s) and ${refs.length} source(s) — trying next candidate.`
+      );
     }
   }
 
   if (!chosen) {
-    if (errorRounds > 0) {
+    if (errorRounds > 0 || candidateErrors > 0) {
       fail(
-        "Topic selection failed because of a Groq error (invalid JSON or rate limit), not because the niche was empty. " +
-          `Rounds: ${roundsAsked} asked, ${nullRounds} honest empty, ${errorRounds} Groq error(s). Check Groq and re-run.`
+        "Topic selection/research failed because of a Groq or data error, not because the niche was empty. " +
+          `Rounds asked: ${roundsAsked}, empty: ${nullRounds}, Groq errors: ${errorRounds}, candidate errors: ${candidateErrors}. Check Groq/SerpAPI and re-run.`
       );
     }
     if (roundsAsked > 0 && nullRounds === roundsAsked) {
-      console.log("No topic clearly fits the niche (Groq honestly answered null in every round). Exiting without publishing.");
+      console.log(
+        "No topic clearly fits the niche (Groq found no fitting topic in every round). Exiting without publishing."
+      );
       process.exit(0);
     }
-    fail(`Could not complete topic discovery (rounds asked: ${roundsAsked}, empty: ${nullRounds}). Check SerpAPI.`);
+    console.log("No candidate had enough verifiable facts. Exiting without publishing (no fake content added).");
+    process.exit(0);
   }
 
+  const sources = chosen.sources;
+  const facts = chosen.facts;
+  const refs = chosen.refs;
   console.log(`Topic chosen: "${chosen.topic}" (${chosen.area}) — ${chosen.reason}`);
-
-  const topicLower = chosen.topic.toLowerCase();
-  const alreadyPublished = published.some((p) => {
-    const t = String(p.topic || "").toLowerCase();
-    return t === topicLower || topicLower.includes(t) || t.includes(topicLower);
-  });
-  if (alreadyPublished) {
-    console.log("Topic already in published.json. Exiting without publishing.");
-    process.exit(0);
-  }
-
-  // ---- Deep research on the chosen topic ----
-  let sources;
-  try {
-    sources = await researchTopic(chosen.topic, seedHeadlines);
-  } catch (err) {
-    fail("Research failed: " + err.message);
-  }
-
-  // ---- Verified fact sheet ----
-  let facts = [];
-  try {
-    facts = await buildFactSheet(chosen.topic, chosen.area, sources);
-  } catch (err) {
-    fail("Fact extraction failed: " + err.message);
-  }
-  if (facts.length < 5) {
-    console.log(
-      `Only ${facts.length} verified facts found — not enough for a trustworthy post. Exiting without publishing.`
-    );
-    process.exit(0);
-  }
-
-  const refs = uniqueSourceLinks(facts, sources);
-  if (refs.length === 0) {
-    console.log("No real source URLs available for a References section. Exiting without publishing.");
-    process.exit(0);
-  }
-  console.log(`Using ${refs.length} real source links in References.`);
+  console.log(`Sources: ${sources.length} | Verified facts: ${facts.length} | References: ${refs.length}`);
 
   const mentionAuthor = Math.random() < 1 / 3;
   console.log("Author mention in body: " + (mentionAuthor ? "YES (branding post)" : "no"));
@@ -968,7 +982,15 @@ async function main() {
   }
   console.log("Draft post written: " + post.title + " (~" + countWords(post.html) + " words)");
 
-  // ---- Word count enforcement (one expansion retry) ----
+  // ---- Fact-check pass first (fix unsupported claims, keep length) ----
+  try {
+    post = await factCheckPost(post, facts);
+  } catch (err) {
+    console.error("WARNING: fact-check pass failed — " + err.message + " (keeping writer output)");
+  }
+  console.log("After fact-check: ~" + countWords(post.html) + " words");
+
+  // ---- Only if still short, expand strictly within the fact sheet ----
   if (countWords(post.html) < 600) {
     console.log("Word count below 600 — expanding with fact sheet only...");
     try {
@@ -978,17 +1000,10 @@ async function main() {
     }
   }
 
-  // ---- Final fact-check pass ----
-  try {
-    post = await factCheckPost(post, facts);
-  } catch (err) {
-    console.error("WARNING: fact-check pass failed — " + err.message + " (keeping writer output)");
-  }
-
-  // Hard stop: if still under 500 words, don't publish junk.
+  // Hard stop: if still under 600 words, don't publish an incomplete post.
   const finalWords = countWords(post.html);
   console.log("Final word count: " + finalWords);
-  if (finalWords < 500) {
+  if (finalWords < 600) {
     console.log("Post too short after all passes. Exiting without publishing.");
     process.exit(0);
   }
