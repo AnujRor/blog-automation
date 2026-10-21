@@ -37,6 +37,7 @@ const {
   GOOGLE_REFRESH_TOKEN,
   BLOGGER_BLOG_ID,
   PIXABAY_API_KEY,
+  UNSPLASH_ACCESS_KEY,
   SERPAPI_KEY,
   GROQ_API_KEY,
   AUTHOR_NAME,
@@ -652,7 +653,7 @@ HARD RULES (violating any = failed post):
 ${authorRules}
 
 Return ONLY this JSON:
-{"title": "...", "html": "...", "image_query": "2-4 word English stock photo query", "image_alt": "descriptive alt text including the main keyword", "labels": ["3 to 5 short SEO labels"]}`;
+{"title": "...", "html": "...", "image_keywords": ["2-3 BROAD English stock-photo keywords, e.g. artificial intelligence, laptop coding, digital marketing; NEVER specific product or company names"], "image_alts": ["one descriptive alt text per image keyword, same order"], "labels": ["3 to 5 short SEO labels"]}`;
 
   const post = await groqJson(
     [
@@ -671,8 +672,21 @@ Return ONLY this JSON:
   }
   post.title = String(post.title).trim();
   post.html = String(post.html).trim();
-  post.image_query = String(post.image_query || topic).trim();
-  post.image_alt = String(post.image_alt || topic).trim();
+  let imageKeywords = post.image_keywords;
+  if (typeof imageKeywords === "string") imageKeywords = [imageKeywords];
+  if (!Array.isArray(imageKeywords) || imageKeywords.length === 0) {
+    imageKeywords = [post.image_query || topic, "technology"].filter(Boolean);
+  }
+  post.image_keywords = imageKeywords
+    .map((k) => String(k).trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  if (post.image_keywords.length === 0) post.image_keywords = ["technology"];
+  let imageAlts = post.image_alts;
+  if (typeof imageAlts === "string") imageAlts = [imageAlts];
+  post.image_alts = Array.isArray(imageAlts)
+    ? imageAlts.map((a) => String(a).trim()).filter(Boolean)
+    : [];
   post.labels = Array.isArray(post.labels)
     ? post.labels.map((l) => String(l).trim()).filter(Boolean).slice(0, 5)
     : [topic];
@@ -764,16 +778,78 @@ Return ONLY this JSON:
   return post;
 }
 
-// ===================== STEP 6: IMAGE =====================
+// ===================== STEP 6: IMAGES (Unsplash main + Pixabay fallback) =====================
 
-async function fetchPixabayImage(query) {
+function withUtm(url) {
+  const base = url || "https://unsplash.com";
+  const sep = base.includes("?") ? "&" : "?";
+  return base + sep + "utm_source=anuj_auto_blog&utm_medium=referral";
+}
+
+async function registerUnsplashDownload(photo) {
+  const dl = photo && photo.links && photo.links.download_location;
+  if (!dl) return false;
+  try {
+    const res = await fetch(dl, {
+      headers: { Authorization: "Client-ID " + UNSPLASH_ACCESS_KEY },
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function searchUnsplash(keyword, usedIds) {
+  if (!UNSPLASH_ACCESS_KEY) throw new Error("UNSPLASH_ACCESS_KEY is missing");
+  const url =
+    "https://api.unsplash.com/search/photos?query=" + encodeURIComponent(keyword) +
+    "&orientation=landscape&per_page=8&content_filter=high";
+  const data = await fetchJson(
+    url,
+    { headers: { Authorization: "Client-ID " + UNSPLASH_ACCESS_KEY } },
+    "Unsplash"
+  );
+  const results = Array.isArray(data.results) ? data.results : [];
+  return results
+    .filter((p) => p && p.id && p.urls && p.urls.regular && !usedIds.has(p.id))
+    .slice(0, 3);
+}
+
+async function fetchUnsplashPhoto(keyword, usedIds) {
+  let top = await searchUnsplash(keyword, usedIds);
+  if (top.length === 0 && keyword.toLowerCase() !== "technology") {
+    console.log(`Unsplash: no results for "${keyword}", trying broader "technology".`);
+    top = await searchUnsplash("technology", usedIds);
+  }
+  if (top.length === 0) throw new Error(`No Unsplash results for "${keyword}"`);
+  return top[Math.floor(Math.random() * top.length)];
+}
+
+function unsplashFigure(photo, alt) {
+  const src = photo.urls && photo.urls.regular;
+  const name = (photo.user && photo.user.name) || "Photographer";
+  const profile = withUtm(photo.user && photo.user.links && photo.user.links.html);
+  const unsplash = withUtm("https://unsplash.com");
+  return (
+    `<figure style="margin:0 0 24px 0;">` +
+    `<img src="${src}" alt="${alt}" style="width:100%;height:auto;display:block;border-radius:8px;" />` +
+    `<figcaption style="font-size:12px;color:#70757a;margin-top:6px;">Photo by ` +
+    `<a href="${profile}" target="_blank" rel="noopener nofollow">${name}</a> on ` +
+    `<a href="${unsplash}" target="_blank" rel="noopener nofollow">Unsplash</a>` +
+    `</figcaption></figure>`
+  );
+}
+
+async function fetchPixabayImage(query, usedIds = new Set()) {
   const url =
     "https://pixabay.com/api/?key=" + encodeURIComponent(PIXABAY_API_KEY) +
     "&q=" + encodeURIComponent(query) +
     "&image_type=photo&orientation=horizontal&safesearch=true&per_page=5&order=popular";
   const data = await fetchJson(url, {}, "Pixabay");
-  const hits = Array.isArray(data.hits) ? data.hits : [];
-  if (hits.length === 0) {
+  let hits = (Array.isArray(data.hits) ? data.hits : []).filter(
+    (h) => h && h.id && !usedIds.has("pixabay_" + h.id)
+  );
+  if (hits.length === 0 && query.toLowerCase() !== "technology computer") {
     const fallback = await fetchJson(
       "https://pixabay.com/api/?key=" + encodeURIComponent(PIXABAY_API_KEY) +
         "&q=" + encodeURIComponent("technology computer") +
@@ -781,23 +857,72 @@ async function fetchPixabayImage(query) {
       {},
       "Pixabay fallback"
     );
-    if (!Array.isArray(fallback.hits) || fallback.hits.length === 0) {
-      throw new Error("No Pixabay image found.");
-    }
-    return fallback.hits[Math.floor(Math.random() * fallback.hits.length)];
+    hits = (Array.isArray(fallback.hits) ? fallback.hits : []).filter(
+      (h) => h && h.id && !usedIds.has("pixabay_" + h.id)
+    );
   }
+  if (hits.length === 0) throw new Error("No Pixabay image found.");
   return hits[Math.floor(Math.random() * hits.length)];
 }
 
-function imageHtml(image, alt) {
+function pixabayFigure(image, alt) {
   const src = image.webformatURL || image.largeImageURL;
   const credit = image.pageURL || "https://pixabay.com/";
   return (
     `<figure style="margin:0 0 24px 0;">` +
     `<img src="${src}" alt="${alt}" style="width:100%;height:auto;display:block;border-radius:8px;" />` +
-    `<figcaption style="font-size:12px;color:#70757a;margin-top:6px;">Image via <a href="${credit}" target="_blank" rel="noopener">Pixabay</a></figcaption>` +
+    `<figcaption style="font-size:12px;color:#70757a;margin-top:6px;">Image via ` +
+    `<a href="${credit}" target="_blank" rel="noopener">Pixabay</a></figcaption>` +
     `</figure>`
   );
+}
+
+async function getImageForKeyword(keyword, alt, usedIds) {
+  if (UNSPLASH_ACCESS_KEY) {
+    try {
+      const photo = await fetchUnsplashPhoto(keyword, usedIds);
+      const registered = await registerUnsplashDownload(photo);
+      if (!registered) {
+        console.error(`WARNING: Unsplash download_location call failed for photo ${photo.id}.`);
+      }
+      usedIds.add(photo.id);
+      return { html: unsplashFigure(photo, alt), id: photo.id, source: "unsplash" };
+    } catch (err) {
+      console.error(`WARNING: Unsplash failed for "${keyword}" — ${err.message}. Falling back to Pixabay...`);
+    }
+  } else {
+    console.error("WARNING: UNSPLASH_ACCESS_KEY missing, using Pixabay.");
+  }
+  try {
+    const hit = await fetchPixabayImage(keyword, usedIds);
+    usedIds.add("pixabay_" + hit.id);
+    return { html: pixabayFigure(hit, alt), id: "pixabay_" + hit.id, source: "pixabay" };
+  } catch (err) {
+    console.error(`WARNING: Pixabay also failed for "${keyword}" — ${err.message}.`);
+    return null;
+  }
+}
+
+function insertBetweenSections(html, figures) {
+  if (!figures || figures.length === 0) return html;
+  const positions = [];
+  const re = /<h2[^>]*>([\s\S]*?)<\/h2>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const headingText = m[1].replace(/<[^>]+>/g, "").toLowerCase();
+    if (!headingText.includes("references")) positions.push(m.index);
+  }
+  const targets = [];
+  if (positions.length >= 2) targets.push(positions[1]);
+  if (figures.length >= 2 && positions.length >= 4) targets.push(positions[3]);
+  if (targets.length === 0) return html;
+  const inserts = targets
+    .slice(0, figures.length)
+    .map((pos, i) => ({ pos, html: figures[i] }))
+    .sort((a, b) => b.pos - a.pos);
+  let out = html;
+  for (const ins of inserts) out = out.slice(0, ins.pos) + ins.html + out.slice(ins.pos);
+  return out;
 }
 
 // ===================== STEP 7: GOOGLE + BLOGGER =====================
@@ -1008,18 +1133,41 @@ async function main() {
     process.exit(0);
   }
 
-  // ---- Image ----
-  let image;
-  try {
-    image = await fetchPixabayImage(post.image_query);
-  } catch (err) {
-    console.error("WARNING: " + err.message + " — publishing without image.");
-    image = null;
+  // ---- Images: Unsplash main, Pixabay fallback (hero + 1-2 between sections) ----
+  const usedIds = new Set();
+  for (const p of published) {
+    if (Array.isArray(p.photoIds)) p.photoIds.forEach((id) => usedIds.add(String(id)));
+    if (p.imageId) usedIds.add(String(p.imageId));
+  }
+
+  const keywordsForImages = post.image_keywords.slice(0, 3);
+  const imageCount = Math.min(3, Math.max(2, keywordsForImages.length));
+  let heroFigure = "";
+  const bodyFigures = [];
+  const usedPhotoIds = [];
+
+  for (let i = 0; i < imageCount; i++) {
+    const kw = keywordsForImages[i] || keywordsForImages[0] || "technology";
+    const alt = post.image_alts[i] || `${kw} — illustration for ${chosen.topic}`;
+    let picked = null;
+    try {
+      picked = await getImageForKeyword(kw, alt, usedIds);
+    } catch (err) {
+      console.error(`WARNING: image step failed for "${kw}" — ${err.message}.`);
+    }
+    if (!picked) continue;
+    usedPhotoIds.push(picked.id);
+    if (!heroFigure) heroFigure = picked.html;
+    else bodyFigures.push(picked.html);
+  }
+
+  if (usedPhotoIds.length === 0) {
+    console.error("WARNING: no images could be fetched from Unsplash or Pixabay — publishing without images.");
   }
 
   let html = "";
-  if (image) html += imageHtml(image, post.image_alt);
-  html += post.html;
+  if (heroFigure) html += heroFigure;
+  html += insertBetweenSections(post.html, bodyFigures);
   html += "\n" + authorBoxHtml();
 
   // Safety: never let the author name leak into the title.
@@ -1045,6 +1193,7 @@ async function main() {
     id: result.id,
     url: result.url || "",
     status: PUBLISH_LIVE ? "live" : "draft",
+    photoIds: usedPhotoIds,
     factCount: facts.length,
     sourceCount: refs.length,
     date: new Date().toISOString(),
@@ -1055,6 +1204,7 @@ async function main() {
   console.log("Saved as: " + (PUBLISH_LIVE ? "live post" : "DRAFT"));
   console.log("Title: " + finalTitle);
   console.log("Facts used: " + facts.length + " | Sources in refs: " + refs.length);
+  console.log("Images: " + usedPhotoIds.length + " (" + (usedPhotoIds.length ? "hero + body" : "none") + ")");
   console.log("Post URL: " + (result.url || ("(draft id " + result.id + ")")));
   console.log("published.json updated.");
 }
